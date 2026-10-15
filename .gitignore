@@ -36,3 +36,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Downloaded agy binaries (placed by scripts/postinstall.ts, not committed)
 /bin/agy
 /bin/agy.exe
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
