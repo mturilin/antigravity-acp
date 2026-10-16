@@ -20,6 +20,7 @@ import type {
 	SetSessionConfigOptionResponse,
 } from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
+import { SessionMcpPlugins, stdioServers } from "../agy/mcp";
 import { type DiscoveredModel, discoverModels, runNonInteractivePrompt } from "../agy/process";
 import { formatUsageOutput } from "../agy/usage-format";
 import {
@@ -47,6 +48,8 @@ export interface AgentConfig {
 	workingDir: string;
 	skipNarration: boolean;
 	version: string;
+	/** Where per-session MCP plugin folders go (default MCP_SESSIONS_DIR in agy/mcp.ts). */
+	mcpSessionsDir?: string;
 }
 
 type Json = Record<string, unknown>;
@@ -67,8 +70,14 @@ export class AgyAcpAgent {
 	private availableModels: DiscoveredModel[] = [];
 	// Tracks which AcpClient is serving each session so async updates can be pushed.
 	private readonly activeClients = new Map<string, AcpClient>();
+	// Per-session plugin folders carrying each session's MCP servers to agy.
+	// In memory only: the servers' env holds client tokens, so they are never
+	// written to sessions.json; clients resend them on session/load|resume.
+	private readonly mcp: SessionMcpPlugins;
 
 	constructor(private readonly config: AgentConfig) {
+		this.mcp = new SessionMcpPlugins(config.mcpSessionsDir);
+		this.mcp.sweepStale();
 		this.sessions = new SessionManager(new SessionStore());
 		this.adapter = new Adapter({
 			binary: config.binary,
@@ -143,6 +152,9 @@ export class AgyAcpAgent {
 				// private temp file and directs agy's view_file tool at it (see writeImage
 				// below). `audio` stays unset: agy has no equivalent ingestion path yet.
 				promptCapabilities: { image: true, embeddedContext: true },
+				// Session MCP servers reach agy through a per-session plugin
+				// (agy/mcp.ts). Only stdio servers are passed on for now.
+				mcpCapabilities: { http: false, sse: false },
 				sessionCapabilities: {
 					list: {},
 					delete: {},
@@ -184,12 +196,17 @@ export class AgyAcpAgent {
 	}
 
 	newSession(
-		params: { cwd?: string; additionalDirectories?: string[] },
+		params: {
+			cwd?: string;
+			additionalDirectories?: string[];
+			mcpServers?: unknown;
+		},
 		client: AcpClient,
 	): NewSessionResponse {
 		const cwd = params.cwd || this.config.workingDir;
 		const additionalDirs = params.additionalDirectories ?? [];
 		const { sessionId, session } = this.sessions.create(cwd, additionalDirs);
+		this.applyMcpServers(sessionId, params.mcpServers);
 		this.activeClients.set(sessionId, client);
 		this.announceSession(client, sessionId, session);
 		return { sessionId, ...this.configResult(session) };
@@ -200,6 +217,7 @@ export class AgyAcpAgent {
 			sessionId?: string;
 			cwd?: string;
 			additionalDirectories?: string[];
+			mcpServers?: unknown;
 		},
 		client: AcpClient,
 	): Promise<LoadSessionResponse> {
@@ -213,6 +231,7 @@ export class AgyAcpAgent {
 		if (params.additionalDirectories) {
 			session.additionalDirs = params.additionalDirectories;
 		}
+		this.applyMcpServers(sessionId, params.mcpServers);
 
 		if (session.conversationId) {
 			const replay = this.replayCache.get(
@@ -239,6 +258,7 @@ export class AgyAcpAgent {
 			sessionId?: string;
 			cwd?: string;
 			additionalDirectories?: string[];
+			mcpServers?: unknown;
 		},
 		client: AcpClient,
 	): Promise<ResumeSessionResponse> {
@@ -256,6 +276,7 @@ export class AgyAcpAgent {
 			dirty = true;
 		}
 		if (dirty) await this.sessions.persist(sessionId, session);
+		this.applyMcpServers(sessionId, params.mcpServers);
 
 		this.activeClients.set(sessionId, client);
 		this.announceSession(client, sessionId, session);
@@ -273,6 +294,7 @@ export class AgyAcpAgent {
 			sessionId?: string;
 			cwd?: string;
 			additionalDirectories?: string[];
+			mcpServers?: unknown;
 		},
 		client: AcpClient,
 	): Promise<ForkSessionResponse> {
@@ -310,6 +332,9 @@ export class AgyAcpAgent {
 		session.sandbox = source.sandbox;
 		session.title = source.title;
 		await this.sessions.persist(sessionId, session);
+		// The fork's own servers, not the source's: a client's servers can carry
+		// per-session credentials.
+		this.applyMcpServers(sessionId, params.mcpServers);
 
 		this.activeClients.set(sessionId, client);
 		this.announceSession(client, sessionId, session);
@@ -338,6 +363,7 @@ export class AgyAcpAgent {
 		const deleted = await this.sessions.delete(sessionId);
 		if (!deleted) throw RequestError.resourceNotFound(sessionId);
 		this.activeClients.delete(sessionId);
+		this.removeMcpServers(sessionId);
 		return {};
 	}
 
@@ -348,8 +374,52 @@ export class AgyAcpAgent {
 			this.adapter.cancel(sessionId);
 			this.sessions.evict(sessionId);
 			this.activeClients.delete(sessionId);
+			this.removeMcpServers(sessionId);
 		}
 		return {};
+	}
+
+	/** Remove every per-session MCP folder this process wrote (on shutdown). */
+	dispose(): void {
+		this.mcp.removeAll();
+	}
+
+	/** Record the MCP servers a client sent for a session. `undefined` (the
+	 *  field left out) keeps what the session had; a list, even an empty one,
+	 *  replaces it. Failing to write them is logged, not fatal: the session
+	 *  still works, only without those tools. */
+	private applyMcpServers(sessionId: string, mcpServers: unknown): void {
+		if (mcpServers === undefined) return;
+		try {
+			this.mcp.set(sessionId, stdioServers(mcpServers));
+		} catch (err) {
+			console.error(
+				`[agy-acp] could not pass MCP servers to agy for ${sessionId}:`,
+				(err as Error).message,
+			);
+		}
+	}
+
+	private removeMcpServers(sessionId: string): void {
+		try {
+			this.mcp.remove(sessionId);
+		} catch {
+			// best effort; the next start sweeps what is left
+		}
+	}
+
+	/** The session's plugin folder for this turn; a failure to (re)write it
+	 *  costs the turn its MCP tools, not the turn itself. */
+	private mcpRootFor(sessionId: string): string | null {
+		try {
+			return this.mcp.root(sessionId);
+		} catch (err) {
+			console.error(
+				`[agy-acp] could not pass MCP servers to agy for ${sessionId}:`,
+				(err as Error).message,
+			);
+			return null;
+		}
 	}
 
 	async prompt(
@@ -388,6 +458,7 @@ export class AgyAcpAgent {
 			session,
 			rawText,
 			client,
+			this.mcpRootFor(sessionId),
 		);
 
 		// Record the steps even when the turn failed, so the next prompt does not
